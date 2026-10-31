@@ -97,8 +97,23 @@ streams:
   door1: rtsp://127.0.0.1:8554/camera1
 ```
 
+Отдельный стрим на `/camera1/talk` не нужен: backchannel входит в каждый
+DESCRIBE, микрофон доступен прямо на `door1`.
+
 Слот динамика занимается только реальным звуком: 2 секунды тишины —
 и канал свободен (push-to-talk семантика).
+
+Устойчивость к капризам прошивки (проверено на железе):
+
+- слот громкой связи у панели **один на все вызывные панели**
+  (занято → `TLV 332 result=23`): шлюз держит ретраи раз в 3 с, пока
+  идёт звук — соседний разговор закончился, микрофон подключится сам;
+- если прошивка «застряла» (нет ответа на TLV 331), панель сама рвёт
+  OWSP-сессию канала (~30 с): шлюз чистит слот `331 action=2`,
+  переподключается и продолжает говорить без передёргивания клиента;
+- обрыв OWSP-сессии посреди разговора не ломает канал: шлюз делает
+  **свежий 331** на новой сессии (а не льёт аудио в никуда) — прошивка
+  такого не прощает.
 
 ## MQTT
 
@@ -117,6 +132,124 @@ base_topic = slinex/door
   (LWT: offline/online)
 - подписка: `{base}/cmd/unlock` `{"channel":1,"action":1,"delay":1}`,
   `{base}/cmd/volume` `{"channel":1,"direction":"down","steps":3}`
+
+## Интеграция с Home Assistant
+
+Типовая топология (адреса замените на свои):
+
+```
+[панели STM83xx 192.168.1.50] ⇄ OWSP ⇄ [шлюз 192.168.1.10]
+                                            RTSP:8554 / HTTP:8555
+[Frigate 192.168.1.30] ← RTSP ←──── шлюз (запись/детекция)
+[HA 192.168.1.20 + go2rtc] ← RTSP ←── шлюз (live + микрофон)
+```
+
+Шлюз раздаёт RTSP нескольким клиентам одновременно (Frigate + go2rtc),
+не занимая лишних подключений панели.
+
+### 1. MQTT — один брокер на всех
+
+Опубликуйте события шлюза в тот же брокер, что использует HA
+(например, Mosquitto-аддон на хосте HA). Создайте пользователя HA
+для шлюза (Настройки → Люди → Пользователи) и укажите его в
+`slinex_gateway.conf`:
+
+```ini
+[mqtt]
+enabled = 1
+host = 192.168.1.20
+username = slinex-gw
+password = <пароль пользователя HA>
+```
+
+Проверка: HA → интеграция MQTT → «Прослушивать топик» `slinex/#` →
+нажать кнопку звонка на панели.
+
+### 2. `configuration.yaml`: замок и статус
+
+```yaml
+mqtt:
+  button:
+    - name: "Дверь 1 — открыть"
+      unique_id: slinex_lock_1
+      icon: mdi:door-open
+      command_topic: "slinex/cmd/unlock"
+      payload_press: '{"channel": 1, "action": 1, "delay": 1}'
+    - name: "Дверь 2 — открыть"
+      unique_id: slinex_lock_2
+      icon: mdi:door-open
+      command_topic: "slinex/cmd/unlock"
+      payload_press: '{"channel": 2, "action": 1, "delay": 1}'
+
+rest:
+  - resource: http://192.168.1.10:8555/status
+    scan_interval: 30
+    sensor:
+      - name: "Домофон: каналы онлайн"
+        unique_id: slinex_channels
+        value_template: >
+          {{ value_json.channels | selectattr('login_ok', 'truthy')
+             | list | count }}/{{ value_json.channels | count }}
+```
+
+### 3. Автоматизация звонка (push со снимком)
+
+```yaml
+- alias: "Домофон: звонок"
+  id: slinex_ring
+  trigger:
+    - platform: mqtt
+      topic: "slinex/events/ring"
+  condition: >
+    {{ trigger.payload_json.state == 'start' }}
+  action:
+    - service: camera.snapshot
+      target: {entity_id: camera.door_1}     # из Frigate (шаг 4)
+      data: {filename: "/config/www/door1_last.jpg"}
+    - service: notify.mobile_app_телефон
+      data:
+        title: "Домофон"
+        message: "Звонок ({{ trigger.payload_json.channels | join(', ') }})"
+        data:
+          image: "/local/door1_last.jpg"
+```
+
+### 4. Frigate — запись и детекция
+
+Конфиг Frigate (там же, где его интеграция с HA — брокер общий):
+
+```yaml
+cameras:
+  door1:
+    ffmpeg:
+      inputs:
+        - path: rtsp://192.168.1.10:8554/camera1
+          roles: [detect]          # + record, если нужна история
+  door2:
+    ffmpeg:
+      inputs:
+        - path: rtsp://192.168.1.10:8554/camera2
+          roles: [detect]
+```
+
+Появятся `camera.door_1`/`camera.door_2` для снапшотов и карточек
+Frigate. 320×240@5fps для детекции достаточно и почти бесплатно по CPU.
+
+### 5. Lovelace: live и микрофон
+
+- просмотр/клипы — карточка Frigate на `camera.door_1`;
+- two-way audio — карточка [WebRTC Camera](https://github.com/AlexxIT/WebRTC)
+  (связка того же автора, что и go2rtc-аддон):
+
+```yaml
+type: custom:webrtc-camera
+entity: camera.door_1
+ui: true        # кнопка микрофона
+```
+
+Сущности камеры достаточно `stream_source`, совпадающего со стримом
+go2rtc. Для микрофона обязателен HTTPS (Nabu Casa / reverse proxy) —
+иначе браузер не даст доступ к getUserMedia.
 
 ## Ограничения прошивки STM83xx (проверено на железе)
 
@@ -145,7 +278,8 @@ done
 
 Покрытие: логин/ресинк/ротация, RTSP+RTP (UDP/TCP), многоканальность,
 замок, ring-детектор, MQTT, тайм-синк/TLV-монитор, громкая связь
-(таблицы µ-law, HTTP/RTSP/backchannel, эксклюзив, отказ старта).
+(таблицы µ-law, HTTP/RTSP/backchannel, эксклюзив, отказ и застревание
+старта с ретраями, обрыв OWSP посреди разговора).
 
 ## Структура
 

@@ -33,12 +33,20 @@
    TalkSession ЛЕНИВАЯ: SETUP trackID=2 не занимает канал (проверка
    /status), сессию открывает первый interleaved-RTP на канале 2;
    контент совпал, старт/стоп по закрытию;
-4. эксклюзивность: /talk с недосланным телом держит канал → второй
-   POST /talk отвечает 409; после завершения — снова 200.
-5. отказ старта: мок отвечает TLV 332 result=23 («talk занят» — как
-   железо 31.10 15:21 после потерянного в мусоре 332) → /talk отвечает
-   ok=false c диагнозом, sent=0, и шлюз ЧИСТИТ состояние панели
-   331 action=2 (мок видит стоп без старта); повторный /talk — штатно.
+ 4. эксклюзивность: /talk с недосланным телом держит канал → второй
+    POST /talk отвечает 409; после завершения — снова 200.
+ 5. отказ/застревание старта (железо 31.10 21:24–22:08): (a) result=23
+    — talk занят: слот у панели ОДИН на все панели; (б) панель молчит
+    на 331 (talk-движок застрял, сама рвёт OWSP ~30 с) → /talk отвечает
+    ok=false с диагнозом; ретраи раз в 3 с; cleanup 331/2 — ТОЛЬКО при
+    таймауте 332 (явный отказ — чистить нечего); повторный /talk —
+    штатно.
+ 6. обрыв OWSP-сессии посреди talk (как прошивка при застрявшем
+    talk-движке): после реконнекта канала шлюз обязан сделать СВЕЖИЙ
+    331 на новой сессии (первым talk-TLV), НЕ льёт 97/98 без него
+    (инцидент 31.10: при активном микрофоне канал «не поднимался»,
+    пока не уйдёшь с карточки); аудио продолжается, событие
+    end reason=session, финальный cleanup — ровно один 331/2.
 Пост-мортем: в логе шлюза «talk-формат: 8000 Гц … wave=0x7A25» —
 парсер 332 по раскладке железа.
 """
@@ -156,14 +164,26 @@ def mock_doorphone(stop, state):
                                 ok = (len(v) == 8 and devid == 0
                                       and action in (1, 2) and chn == 1)
                                 state["talk_reqs_ok"].append(ok)
+                                state.setdefault(
+                                    "conn_tlvs", {}).setdefault(
+                                    idx, []).append(331)
+                                silent = state.pop("silent_talk", False)
                                 if action == 2:
                                     state["talk_stops"] += 1
-                                    conn.sendall(owsp_packet(
-                                        [(332, talk_rsp)], 910))
+                                    if not silent:
+                                        conn.sendall(owsp_packet(
+                                            [(332, talk_rsp)], 910))
+                                elif silent:
+                                    # фаза 5b: панель застряла — на 331
+                                    # нет ответа (железо 31.10 21:24/22:08:
+                                    # «нет ответа TLV 332 за 5 с», панель
+                                    # сама рвёт OWSP-сессию ~30 с)
+                                    print("[mock] TLV 331: молчим "
+                                          "(панель застряла)", flush=True)
                                 elif state.pop("refuse_talk", False):
-                                    # фаза 5: панель отказывает старту
-                                    # (железо 31.10 15:21: result=23 —
-                                    # «talk занят» после потерянного 332)
+                                    # фаза 5a: явный отказ — «talk занят»
+                                    # (железо 31.10 21:35/22:08: слот у
+                                    # панели ОДИН на все панели)
                                     print("[mock] TLV 331: отказ "
                                           "result=23 (refuse_talk)",
                                           flush=True)
@@ -184,12 +204,21 @@ def mock_doorphone(stop, state):
                                       == 200)
                                 state["info97_ok"].append(ok)
                                 saw97 = ok
+                                state.setdefault(
+                                    "conn_tlvs", {}).setdefault(
+                                    idx, []).append(97)
                             elif t == 98 and saw97 is not None:
                                 state["talk_chunks"].append(bytes(v))
             threading.Thread(target=drain, daemon=True).start()
 
             frame_idx = 0
             while not stop.is_set():
+                if state.pop("kill_owsp", False):
+                    # фаза 6: панель рвёт OWSP-соединение посреди talk
+                    # (как застрявший talk-движок прошивки — 31.10)
+                    print("[mock] kill_owsp: рвём OWSP-соединение",
+                          flush=True)
+                    break
                 frame = IDR if frame_idx % 15 == 0 else PFRAME
                 t = 100 if frame_idx % 15 == 0 else 101
                 fb = struct.pack("<HH", 99, 12) + struct.pack(
@@ -517,34 +546,55 @@ def main():
             fails.append("фаза 4: starts=%s stops=%s (ожидалось 4/4)"
                          % (state["talk_starts"], state["talk_stops"]))
 
-        # ---- фаза 5: отказ старта (result=23) → cleanup 331/2 ----------
-        # Железо 31.10 15:21: 332 потерялась в мусоре протокола, панель
-        # держала talk занятым и отказала соседнему каналу result=23.
-        # Шлюз при провале старта должен послать 331 action=2 (очистка
-        # состояния панели), а /talk — ответить ok=false с диагнозом
-        print("--- фаза 5: отказ старта + cleanup ---")
+        # ---- фаза 5: отказ (23) и застревание (таймаут 332) старта ---
+        # Железо 31.10 21:24–22:08: (a) result=23 — talk занят: слот у
+        # панели ОДИН на все панели (разговор с соседней); (б) панель
+        # молчит на 331 — talk-движок застрял, сама рвёт OWSP-сессию
+        # канала через ~30 с. Провал НЕ фатален: ретраи раз в 3 с, пока
+        # идёт звук; cleanup 331/2 — только при таймауте (332 мог
+        # потеряться, а talk начаться — инцидент 15:21); при явном
+        # отказе чистить нечего
+        print("--- фаза 5: отказ 23, таймаут 332, ретраи ---")
         state["refuse_talk"] = True
         refuse = (bytes(range(64)) * 50)[:3200]
         code, body = http_json(
             "POST", "http://127.0.0.1:%d/talk?ch=1" % HTTP_PORT, data=refuse,
             headers={"Content-Type": "audio/basic"})
-        print("[http] /talk (отказ) → %s %s" % (code, body), flush=True)
+        print("[http] /talk (отказ 23) → %s %s" % (code, body), flush=True)
         if code != 200 or body.get("ok"):
-            fails.append("фаза 5: /talk при отказе должен быть ok=false: "
+            fails.append("фаза 5a: /talk при отказе должен быть ok=false: "
                          "%s %s" % (code, body))
         if "23" not in str(body.get("error")):
-            fails.append("фаза 5: в ошибке нет result=23: %s"
+            fails.append("фаза 5a: в ошибке нет result=23: %s"
                          % body.get("error"))
         if body.get("sent") != 0:
-            fails.append("фаза 5: sent=%s (ожидалось 0)" % body.get("sent"))
+            fails.append("фаза 5a: sent=%s (ожидалось 0)" % body.get("sent"))
         time.sleep(0.5)
+        if state["talk_stops"] != 4:
+            fails.append("фаза 5a: при явном отказе cleanup 331/2 не нужен "
+                         "(stops=%s, ожидалось 4)" % state["talk_stops"])
+        if state["talk_starts"] != 4:
+            fails.append("фаза 5a: starts=%s (ожидалось 4 — старт не "
+                         "считается)" % state["talk_starts"])
+        state["silent_talk"] = True
+        code, body = http_json(
+            "POST", "http://127.0.0.1:%d/talk?ch=1" % HTTP_PORT, data=refuse,
+            headers={"Content-Type": "audio/basic"})
+        print("[http] /talk (панель молчит) → %s %s" % (code, body),
+              flush=True)
+        if code != 200 or body.get("ok"):
+            fails.append("фаза 5b: /talk при таймауте должен быть ok=false: "
+                         "%s %s" % (code, body))
+        if "нет ответа" not in str(body.get("error")):
+            fails.append("фаза 5b: в ошибке нет «нет ответа»: %s"
+                         % body.get("error"))
         if state["talk_stops"] != 5:
-            fails.append("фаза 5: cleanup 331/2 не отправлен "
+            fails.append("фаза 5b: cleanup 331/2 при таймауте не отправлен "
                          "(stops=%s, ожидалось 5)" % state["talk_stops"])
         if state["talk_starts"] != 4:
-            fails.append("фаза 5: starts=%s (ожидалось 4 — старт не должен "
-                         "считаться)" % state["talk_starts"])
-        # после очистки панели повторный /talk проходит штатно
+            fails.append("фаза 5b: starts=%s (ожидалось 4)" %
+                         state["talk_starts"])
+        # после «очистки» панели повторный /talk проходит штатно
         code, body = http_json(
             "POST", "http://127.0.0.1:%d/talk?ch=1" % HTTP_PORT, data=refuse,
             headers={"Content-Type": "audio/basic"})
@@ -554,6 +604,95 @@ def main():
         if state["talk_starts"] != 5 or state["talk_stops"] != 6:
             fails.append("фаза 5: итог starts=%s stops=%s (ожидалось 5/6)"
                          % (state["talk_starts"], state["talk_stops"]))
+
+        # ---- фаза 6: обрыв OWSP посреди talk → свежий 331 ------------
+        # Инцидент 31.10: при активном микрофоне канал «не поднимался»,
+        # пока не уйдёшь с карточки — после реконнекта шлюз лил 97/98
+        # в новую сессию без 331, прошивка рвала соединение каскадом.
+        # Теперь: gen-сброс → событие end reason=session → СВЕЖИЙ 331
+        # первым talk-TLV на новой сессии → аудио продолжается
+        print("--- фаза 6: обрыв OWSP посреди talk ---")
+        starts_before = state["talk_starts"]
+        stops_before = state["talk_stops"]
+        sdp6 = ("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=talk\r\n"
+                "c=IN IP4 127.0.0.1\r\nt=0 0\r\n"
+                "m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000/1\r\n"
+                "a=control:trackID=0\r\n")
+        base6 = "rtsp://127.0.0.1:%d/camera/talk" % RTSP_PORT
+        rs2 = socket.create_connection(("127.0.0.1", RTSP_PORT), timeout=10)
+        snd_stop = threading.Event()
+
+        def mic_sender():
+            # как go2rtc: RTP с микрофона 160 Б / 40 мс, непрерывно
+            i = 0
+            while not snd_stop.is_set():
+                rtp = (struct.pack(">BBHII", 0x80, 0x80, 4000 + i,
+                                   160 * i, 0x34567890)
+                       + bytes([(i * 7) & 0xFF]) * 160)
+                try:
+                    rs2.sendall(b"$" + struct.pack(">BH", 0, len(rtp)) + rtp)
+                except OSError:
+                    return
+                i += 1
+                time.sleep(0.04)
+
+        try:
+            code, hdrs, _ = rtsp_round(rs2, "ANNOUNCE", base6, {},
+                                       sdp6.encode())
+            if code != 200:
+                fails.append("фаза 6: ANNOUNCE → %s" % code)
+            sid = hdrs.get("session", "")
+            code, hdrs, _ = rtsp_round(
+                rs2, "SETUP", base6 + "/trackID=0",
+                {"Transport": "RTP/AVP/TCP;unicast;interleaved=0-1;"
+                              "mode=record", "Session": sid})
+            if code != 200:
+                fails.append("фаза 6: SETUP → %s" % code)
+            code, _, _ = rtsp_round(rs2, "RECORD", base6, {"Session": sid})
+            if code != 200:
+                fails.append("фаза 6: RECORD → %s" % code)
+            threading.Thread(target=mic_sender, daemon=True).start()
+            deadline = time.monotonic() + 5
+            while (time.monotonic() < deadline
+                   and state["talk_starts"] == starts_before):
+                time.sleep(0.05)
+            if state["talk_starts"] != starts_before + 1:
+                fails.append("фаза 6: talk не стартовал до обрыва "
+                             "(starts=%s)" % state["talk_starts"])
+            time.sleep(0.6)                    # аудио течёт по сессии 1
+            state["kill_owsp"] = True           # панель рвёт OWSP
+            # реконнект 3 с + ретраи → свежий 331 на новой сессии
+            deadline = time.monotonic() + 20
+            while (time.monotonic() < deadline
+                   and state["talk_starts"] < starts_before + 2):
+                time.sleep(0.1)
+            if state["talk_starts"] != starts_before + 2:
+                fails.append("фаза 6: talk не восстановился после обрыва "
+                             "OWSP (starts=%s)" % state["talk_starts"])
+            time.sleep(1.0)                     # аудио льётся дальше
+        finally:
+            snd_stop.set()
+            rs2.close()
+        time.sleep(1.5)                         # cleanup → 331/2
+        conns = state.get("conn_tlvs") or {}
+        last = conns.get(max(conns)) if conns else None
+        if not last or last[0] != 331:
+            fails.append("фаза 6: на новой OWSP-сессии первый talk-TLV "
+                         "не 331: %s" % last)
+        if not last or 97 not in last:
+            fails.append("фаза 6: аудио не продолжилось на новой сессии: "
+                         "%s" % last)
+        if state["talk_stops"] != stops_before + 1:
+            fails.append("фаза 6: stops=%s (ожидался ровно один финальный "
+                         "cleanup, %s)" % (state["talk_stops"],
+                                           stops_before + 1))
+        code, body = http_json("GET",
+                               "http://127.0.0.1:%d/events" % HTTP_PORT)
+        talks = [e for e in body.get("events", [])
+                 if e.get("kind") == "talk"]
+        if not any(e.get("reason") == "session" for e in talks):
+            fails.append("фаза 6: нет события talk end reason=session: %s"
+                         % talks[-6:])
     finally:
         gw.terminate()
         try:

@@ -801,6 +801,11 @@ class OwspClient(threading.Thread):
         self._last_rx = 0.0        # время последнего чанка от устройства
         self._last_login_code = None  # код последнего отказа логина (TLV 42)
         self._fail_streak = 0      # подряд неудачных попыток (для backoff)
+        self.sess_gen = 0           # поколение OWSP-сессии (+1 на каждый
+        # реконнект): TalkSession отслеживает, чтобы после смерти сессии
+        # НЕ лить 97/98 без свежего 331 (прошивка рвёт соединение —
+        # инцидент 31.10: при 2way канал «не поднимался», пока активен
+        # микрофон)
         # команды из других потоков (HTTP-контроль/CLI/MQTT): пакеты
         # кладутся в очередь и отправляются циклом сессии — единственный
         # писатель в сокет, никакой гонки с реконнектом
@@ -978,6 +983,11 @@ class OwspClient(threading.Thread):
                            "поддерживает talk или сессия умерла" % timeout)
         if self._talk_result == 1:
             return True, "talk: начат (TLV 332 result=1)"
+        if self._talk_result == 23:
+            # железо 31.10 21:35/22:08: слот talk у панели ОДИН на все
+            # панели — соседний разговор заканчивается, ретрай подхватит
+            return False, ("talk: отказ (TLV 332 result=23 — занято; "
+                           "возможно, идёт разговор с другой панели)")
         return False, "talk: отказ (TLV 332 result=%s)" % self._talk_result
 
     def talk_stop(self, timeout=1.5):
@@ -1066,6 +1076,17 @@ class OwspClient(threading.Thread):
         self.log("остановлен")
 
     def _session(self):
+        # поколение сессии: TalkSession по нему понимает, что панель
+        # потеряла talk-контекст (реконнект), и делает свежий 331
+        self.sess_gen += 1
+        # выкидываем остатки очереди мёртвой сессии: висящие talk-чанки
+        # 97/98 иначе уйдут в НОВУЮ сессию раньше свежего 331 — прошивка
+        # рвёт соединение (поймано фазой 6 itest11)
+        while True:
+            try:
+                self._send_q.get_nowait()
+            except queue.Empty:
+                break
         # статистику сбрасываем ДО логина: неудачная попытка не должна
         # показывать цифры прошлой сессии
         self._t0 = None
@@ -1168,14 +1189,20 @@ class OwspClient(threading.Thread):
                     ack_t = self._audio_ack_time(tlvs)
                     if ack_t is not None and self.send_audio_ack:
                         self._send_audio_ack(sock, ack_t)
-            # исходящие команды (замок TLV 425 и т.п.) из других потоков:
-            # отправляет цикл сессии — единственный писатель в сокет
+            # исходящие команды (замок TLV 425, talk-чанки 97/98) из
+            # других потоков: отправляет цикл сессии — единственный
+            # писатель в сокет. Таймаут отправки 10 с, а не 1 с чтения:
+            # медленный приём панели во время 2way не должен рвать
+            # сессию по socket.timeout (sendall наследует settimeout)
             try:
+                sock.settimeout(10.0)
                 while True:
                     pkt = self._send_q.get_nowait()
                     sock.sendall(pkt)
             except queue.Empty:
                 pass
+            finally:
+                sock.settimeout(1.0)
             now = time.monotonic()
             # сторож простоя («зомби»-сессия): TCP жив, но прошивка молчит —
             # без FIN/RST обычный реконнект никогда не случится, поэтому
@@ -1603,10 +1630,12 @@ class TalkSession:
     def _pacer(self):
         client = self.gateway.get_client(self.channel)
         started = False                  # 331/332 выполнены
-        failed = False                   # 332 не пришёл/отказ
+        gen = None                        # поколение OWSP-сессии старта
         buf = bytearray()
         t_start = 0.0
         next_send = 0.0
+        next_try = 0.0                   # когда снова пробовать 331
+        last_err = None                  # последняя ошибка (событие — раз)
         while not self._stop.is_set():
             # ожидание данных: если буфер полон и пейсинг уже готов —
             # спим до next_send (иначе таймаут очереди 50 мс растягивал
@@ -1622,34 +1651,61 @@ class TalkSession:
                     buf += data
             except queue.Empty:
                 pass
-            # старт по первому звуку
-            if not started and not failed and buf:
+            # OWSP-сессия канала умерла и пересоздалась: talk-контекст
+            # панели потерян, лить 97/98 без свежего 331 нельзя — прошивка
+            # рвёт соединение (инцидент 31.10: при активном микрофоне канал
+            # «не поднимался», пока не уйдёшь с карточки). Конец без 331/2:
+            # останавливать на панели нечего (новая сессия), буфер жив
+            if started and client.sess_gen != gen:
+                if client.login_ok.is_set():
+                    self.gateway._add_event("talk", {
+                        "channel": self.channel, "state": "end",
+                        "bytes": self.bytes_sent, "reason": "session"})
+                    started = False
+                    t_start = 0.0
+                    gen = None
+                    next_try = 0.0
+                # иначе ждём реконнекта: отправка не идёт (login сброшен
+                # → talk_send_audio мимо), переполнение исключено
+                # (WATERMARK + backpressure ингресса)
+            # старт по первому звуку; неудачи НЕ фатальны — ретраи раз в
+            # 3 с, пока идёт звук (железо 31.10 21:24/22:08):
+            #  - result=23 — talk занят: слот у панели один на все
+            #    панели, соседний разговор кончится — ретрай подхватит
+            #  - таймаут 332 — talk-движок прошивки застрял: панель сама
+            #    рвёт OWSP-сессию канала (~30 с), ретрай попадёт в свежую
+            if not started and buf and time.monotonic() >= next_try:
                 ok, msg = client.talk_start()
                 if ok:
                     started = True
+                    gen = client.sess_gen
                     t_start = time.monotonic()
+                    last_err = None
+                    self.error = None
                     self.gateway._add_event("talk", {
                         "channel": self.channel, "state": "start",
                         "gain_shift": self.gain_shift or None})
                 else:
-                    failed = True
-                    self.error = msg
-                    self._drained(len(buf) + sum(len(d) for d in
-                                                  list(self._q.queue)))
-                    buf.clear()
-                    self.gateway._add_event("talk", {
-                        "channel": self.channel, "state": "error",
-                        "detail": msg})
-                    # подстраховка (железо 31.10 15:21): 331 мог быть
-                    # принят панелью, а 332 — потеряться (мусор протокола)
-                    # → панель держала talk занятым и отказывала соседнему
-                    # каналу (TLV 332 result=23). Чистим 331 action=2;
-                    # при действительно не начатом talk это безвредно
-                    client.talk_stop()
-            if failed:
+                    if msg != last_err:   # событие раз на серию неудач
+                        last_err = msg
+                        self.error = msg
+                        self.gateway._add_event("talk", {
+                            "channel": self.channel, "state": "error",
+                            "detail": msg})
+                    if "нет ответа" in msg:
+                        # подстраховка (железо 31.10 15:21): 331 мог быть
+                        # принят панелью, а 332 — потеряться (мусор
+                        # протокола) → панель держала talk занятым и
+                        # отказывала соседям (result=23). Чистим 331
+                        # action=2; при явном отказе чистить нечего
+                        client.talk_stop()
+                    next_try = time.monotonic() + 3.0
+            if not started:
                 if buf:
                     self._drained(len(buf))
-                    buf.clear()      # не копим мусор проваленной сессии
+                    buf.clear()      # не копим мусор неустановленной сессии
+                if self.finished:
+                    break            # не начался — чистить на панели нечего
                 continue
             if started:
                 # автостоп по тишине: ингресс не подавал данных 2 с И
