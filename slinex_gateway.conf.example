@@ -1,0 +1,26 @@
+; Конфигурация MQTT-моста шлюза slinex_rtsp.py
+; Файл ищется рядом со скриптом (или задаётся --config FILE).
+; Секция [mqtt] — параметры брокера и топики; всё остальное у шлюза
+; настраивается флагами командной строки.
+
+[mqtt]
+; 0 = не использовать MQTT вообще (или флаг --no-mqtt)
+enabled = 1
+
+; Брокер (mosquitto на хосте шлюза). Пока открытый — креды пустые;
+; при включении авторизации в mosquitto достаточно вписать их сюда.
+host = 127.0.0.1
+port = 1883
+username =
+password =
+
+client_id = slinex-gw
+keepalive = 30
+
+; Топики (относительно base_topic):
+;   публикация: {base}/{events}/ring|unlock|volume, {base}/status (LWT)
+;   подписка:   {base}/{cmd}/unlock {"channel":1,"action":1,"delay":1}
+;               {base}/{cmd}/volume {"channel":1,"direction":"down","steps":3}
+base_topic = slinex/door
+topic_events = events
+topic_commands = cmd
